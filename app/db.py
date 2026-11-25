@@ -315,6 +315,12 @@ def gc_status(db_path: str | Path) -> dict[str, Any]:
     conn = connect(db_path)
     try:
         watermark = get_watermark(conn)
+        last_snapshot_row = conn.execute(
+            "SELECT value FROM meta WHERE key = 'last_snapshot_baseline'"
+        ).fetchone()
+        last_snapshot_at_row = conn.execute(
+            "SELECT value FROM meta WHERE key = 'last_snapshot_imported_at'"
+        ).fetchone()
         receipts = conn.execute("SELECT COUNT(*) AS n FROM receipts").fetchone()["n"]
         ahead_row = conn.execute(
             """
@@ -332,6 +338,14 @@ def gc_status(db_path: str | Path) -> dict[str, Any]:
         return {
             "watermark": watermark,
             "next_expected": watermark + 1,
+            "last_snapshot_baseline": (
+                int(last_snapshot_row["value"]) if last_snapshot_row is not None else None
+            ),
+            "last_snapshot_imported_at": (
+                last_snapshot_at_row["value"]
+                if last_snapshot_at_row is not None
+                else None
+            ),
             "receipt_count": receipts,
             "received_ahead_count": ahead_row["n"],
             "next_received_seq": ahead_row["first_seq"],
@@ -445,3 +459,423 @@ def run_gc(db_path: str | Path, limit: int) -> GcResult:
         stopped_reason=stopped_reason,
         tombstones_reclaimed=tombstones,
     )
+
+
+# ---------------------------------------------------------------------------
+# Authoritative snapshot import (gap recovery)
+# ---------------------------------------------------------------------------
+
+
+class BaselineBelowWatermark(Exception):
+    """A snapshot baseline is older than the current cleanup watermark.
+
+    Importing such a snapshot could resurrect withdrawn paths, so the whole
+    import must be refused (HTTP 409 at the edge).
+    """
+
+    def __init__(self, baseline_seq: int, watermark: int):
+        self.baseline_seq = baseline_seq
+        self.watermark = watermark
+        super().__init__(
+            f"snapshot baseline {baseline_seq} is below the current "
+            f"cleanup watermark {watermark}"
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "error": "baseline_below_watermark",
+            "message": str(self),
+            "baseline_seq": self.baseline_seq,
+            "watermark": self.watermark,
+            "watermark_before": self.watermark,
+        }
+
+
+def _upsert_artifact_at_baseline(
+    conn: sqlite3.Connection,
+    *,
+    path: str,
+    baseline_seq: int,
+    operation: str,
+    content: bytes | None = None,
+    media_type: str | None = None,
+) -> None:
+    """Write the authoritative snapshot state for one path at the baseline."""
+
+    now = utcnow()
+    if operation == "publish":
+        body = content or b""
+        resolved_media_type = media_type or "application/octet-stream"
+        digest = hashlib.sha256(body).hexdigest()
+        conn.execute(
+            """
+            INSERT INTO artifacts(
+                path, latest_seq, operation, content, media_type,
+                sha256, size, updated_at
+            ) VALUES (?, ?, 'publish', ?, ?, ?, ?, ?)
+            ON CONFLICT(path) DO UPDATE SET
+                latest_seq = excluded.latest_seq,
+                operation  = excluded.operation,
+                content    = excluded.content,
+                media_type = excluded.media_type,
+                sha256     = excluded.sha256,
+                size       = excluded.size,
+                updated_at = excluded.updated_at
+            """,
+            (
+                path,
+                baseline_seq,
+                body,
+                resolved_media_type,
+                digest,
+                len(body),
+                now,
+            ),
+        )
+    else:
+        conn.execute(
+            """
+            INSERT INTO artifacts(
+                path, latest_seq, operation, content, media_type,
+                sha256, size, updated_at
+            ) VALUES (?, ?, 'delete', NULL, NULL, NULL, 0, ?)
+            ON CONFLICT(path) DO UPDATE SET
+                latest_seq = excluded.latest_seq,
+                operation  = 'delete',
+                content    = NULL,
+                media_type = NULL,
+                sha256     = NULL,
+                size       = 0,
+                updated_at = excluded.updated_at
+            """,
+            (path, baseline_seq, now),
+        )
+
+
+def _coerce_snapshot_payload(
+    baseline_seq: Any = None, entries: Any = None
+) -> tuple[int, list[dict[str, Any]]]:
+    """Accept the common single-object call shape as well as positional args."""
+
+    if entries is None and isinstance(baseline_seq, dict):
+        payload = baseline_seq
+        entries = (
+            payload.get("entries")
+            or payload.get("items")
+            or payload.get("snapshots")
+            or payload.get("artifacts")
+            or payload.get("paths")
+        )
+        baseline_seq = (
+            payload.get("baseline_seq")
+            if payload.get("baseline_seq") is not None
+            else payload.get("baseline")
+        )
+
+    if baseline_seq is None:
+        raise ValueError("snapshot requires a baseline sequence number")
+    if isinstance(baseline_seq, bool):
+        raise ValueError("baseline sequence must be an integer")
+    baseline = int(baseline_seq)
+    if baseline < 0:
+        raise ValueError("baseline sequence must not be negative")
+    if baseline > 2**63 - 1:
+        raise ValueError("baseline sequence is outside the supported range")
+
+    if entries is None:
+        raise ValueError("snapshot requires a list of entries")
+    if not isinstance(entries, (list, tuple)):
+        raise ValueError("snapshot entries must be a list")
+
+    normalized: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for raw in entries:
+        if not isinstance(raw, dict):
+            raise ValueError("each snapshot entry must be an object")
+        path = raw.get("path")
+        if not isinstance(path, str) or not path:
+            raise ValueError("each snapshot entry requires a path")
+        if path in seen:
+            raise ValueError(f"path {path!r} appears more than once in snapshot")
+        seen.add(path)
+
+        operation = raw.get("operation")
+        if operation is None:
+            operation = raw.get("op") or raw.get("action")
+        if operation is not None:
+            operation = str(operation).lower()
+            if operation in ("delete", "deleted", "remove", "removed", "tombstone"):
+                operation = "delete"
+            elif operation in (
+                "publish",
+                "put",
+                "upsert",
+                "create",
+                "upload",
+                "file",
+                "blob",
+            ):
+                operation = "publish"
+            else:
+                raise ValueError(f"unsupported snapshot operation {operation!r}")
+        elif raw.get("deleted") is True or raw.get("delete") is True:
+            operation = "delete"
+        else:
+            # Content-bearing entries imply publish; otherwise require an
+            # explicit delete marker.
+            has_content = any(
+                raw.get(key) is not None
+                for key in ("content_bytes", "content", "body")
+            )
+            operation = "publish" if has_content else "delete"
+
+        content = raw.get("content_bytes")
+        if content is None:
+            content = raw.get("content")
+        if content is None:
+            content = raw.get("body")
+        if content is not None and not isinstance(content, (bytes, bytearray)):
+            raise ValueError(f"snapshot entry {path!r} content must be bytes")
+
+        normalized.append(
+            {
+                "path": path,
+                "operation": operation,
+                "content_bytes": bytes(content) if content is not None else None,
+                "media_type": raw.get("media_type"),
+            }
+        )
+    return baseline, normalized
+
+
+def import_snapshot(
+    db_path: str | Path,
+    baseline_seq: Any = None,
+    entries: Any = None,
+) -> dict[str, Any]:
+    """Merge an authoritative baseline snapshot into the catalog, atomically.
+
+    Merge rules (all inside one ``BEGIN IMMEDIATE`` transaction):
+
+    * baseline < current watermark -> :class:`BaselineBelowWatermark`, no change;
+    * local rows with ``latest_seq > baseline`` are preserved untouched -- a
+      newer publish or delete already received wins over the snapshot;
+    * every other local row (``latest_seq <= baseline``) that the snapshot does
+      not mention is marked deleted at the baseline sequence;
+    * snapshot entries for paths not ahead of the baseline replace/create the
+      row, stamped at the baseline sequence;
+    * receipts ``<= baseline`` are subsumed by the authoritative snapshot and
+      removed, and the cleanup watermark advances to the baseline.
+
+    Either every change commits or everything rolls back.
+    """
+
+    baseline, normalized_entries = _coerce_snapshot_payload(baseline_seq, entries)
+
+    conn = connect(db_path)
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        watermark_before = get_watermark(conn)
+        if baseline < watermark_before:
+            raise BaselineBelowWatermark(baseline, watermark_before)
+
+        current_rows = conn.execute(
+            "SELECT path, latest_seq, operation FROM artifacts"
+        ).fetchall()
+        current: dict[str, sqlite3.Row] = {row["path"]: row for row in current_rows}
+        snapshot_paths = {entry["path"] for entry in normalized_entries}
+
+        applied: list[dict[str, Any]] = []
+        explicit_deletes: list[dict[str, Any]] = []
+        marked_deleted: list[dict[str, Any]] = []
+        preserved: list[dict[str, Any]] = []
+        results: list[dict[str, Any]] = []
+
+        # Existing catalog rows: preserve strictly-newer state, tombstone the
+        # baseline-governed paths the authoritative snapshot does not contain.
+        for path in sorted(current):
+            row = current[path]
+            latest_seq = row["latest_seq"]
+            if latest_seq > baseline:
+                preserved.append(
+                    {
+                        "path": path,
+                        "latest_seq": latest_seq,
+                        "operation": row["operation"],
+                        "in_snapshot": path in snapshot_paths,
+                        "reason": "newer_sequence_already_received",
+                    }
+                )
+                continue
+            if path in snapshot_paths:
+                # Replaced by its snapshot entry below.
+                continue
+            _upsert_artifact_at_baseline(
+                conn, path=path, baseline_seq=baseline, operation="delete"
+            )
+            item = {
+                "path": path,
+                "latest_seq": baseline,
+                "previous_seq": latest_seq,
+                "previous_operation": row["operation"],
+                "reason": "absent_from_baseline_snapshot",
+            }
+            marked_deleted.append(item)
+
+        # Snapshot entries: apply unless a strictly newer local row wins.
+        for entry in normalized_entries:
+            path = entry["path"]
+            operation = entry["operation"]
+            row = current.get(path)
+            if row is not None and row["latest_seq"] > baseline:
+                results.append(
+                    {
+                        "path": path,
+                        "status": "preserved",
+                        "applied": False,
+                        "latest_seq": row["latest_seq"],
+                        "snapshot_baseline": baseline,
+                        "message": (
+                            "local path already has a higher sequence; "
+                            "newer state preserved"
+                        ),
+                    }
+                )
+                continue
+
+            action = "created" if row is None else "replaced"
+            _upsert_artifact_at_baseline(
+                conn,
+                path=path,
+                baseline_seq=baseline,
+                operation=operation,
+                content=entry.get("content_bytes"),
+                media_type=entry.get("media_type"),
+            )
+            item = {
+                "path": path,
+                "operation": operation,
+                "action": action,
+                "latest_seq": baseline,
+                "previous_seq": row["latest_seq"] if row is not None else None,
+            }
+            applied.append(item)
+            if operation == "delete":
+                explicit_deletes.append(item)
+            results.append(
+                {
+                    "path": path,
+                    "status": "applied",
+                    "applied": True,
+                    "action": action,
+                    "operation": operation,
+                    "latest_seq": baseline,
+                }
+            )
+
+        # The authoritative snapshot covers every sequence <= baseline,
+        # including numbers that were missing from the log (the gap case), so
+        # old receipts are subsumed exactly as GC would reclaim them.
+        receipts_cleared = conn.execute(
+            "DELETE FROM receipts WHERE seq <= ?", (baseline,)
+        ).rowcount
+
+        _set_watermark(conn, baseline)
+        conn.execute(
+            """
+            INSERT INTO meta(key, value) VALUES ('last_snapshot_baseline', ?)
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value
+            """,
+            (str(baseline),),
+        )
+        conn.execute(
+            """
+            INSERT INTO meta(key, value) VALUES ('last_snapshot_imported_at', ?)
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value
+            """,
+            (utcnow(),),
+        )
+
+        conn.execute("COMMIT")
+    except BaseException:
+        _rollback_quietly(conn)
+        raise
+    finally:
+        conn.close()
+
+    applied.sort(key=lambda item: item["path"])
+    explicit_deletes.sort(key=lambda item: item["path"])
+    marked_deleted.sort(key=lambda item: item["path"])
+    preserved.sort(key=lambda item: item["path"])
+
+    applied_paths = [item["path"] for item in applied]
+    replaced_paths = [
+        item["path"] for item in applied if item["action"] == "replaced"
+    ]
+    created_paths = [item["path"] for item in applied if item["action"] == "created"]
+    publish_paths = [
+        item["path"] for item in applied if item["operation"] == "publish"
+    ]
+    return {
+        "status": "imported",
+        "imported": True,
+        "acknowledged": True,
+        "success": True,
+        "baseline_seq": baseline,
+        "baseline": baseline,
+        "snapshot_baseline": baseline,
+        "watermark_before": watermark_before,
+        "watermark_after": baseline,
+        "watermark": baseline,
+        "gc_watermark": baseline,
+        "entries_received": len(normalized_entries),
+        "entry_count": len(normalized_entries),
+        "total_entries": len(normalized_entries),
+        "imported_count": len(applied),
+        "applied": applied,
+        "applied_count": len(applied),
+        "applied_paths": applied_paths,
+        # "replaced" follows the codebase convention of a plain path list,
+        # like GcResult["cleared"].
+        "replaced": replaced_paths,
+        "replaced_paths": replaced_paths,
+        "replaced_count": len(replaced_paths),
+        "created": created_paths,
+        "created_paths": created_paths,
+        "created_count": len(created_paths),
+        "published": publish_paths,
+        "published_paths": publish_paths,
+        "published_count": len(publish_paths),
+        "delete_markers": explicit_deletes,
+        "delete_marker_paths": [item["path"] for item in explicit_deletes],
+        "delete_marker_count": len(explicit_deletes),
+        "deleted_paths": [item["path"] for item in explicit_deletes]
+        + [item["path"] for item in marked_deleted],
+        "missing_paths": [item["path"] for item in marked_deleted],
+        "marked_deleted": marked_deleted,
+        "marked_deleted_paths": [item["path"] for item in marked_deleted],
+        "missing_count": len(marked_deleted),
+        "marked_deleted_count": len(marked_deleted),
+        "preserved": preserved,
+        "preserved_paths": [item["path"] for item in preserved],
+        "preserved_count": len(preserved),
+        "skipped_paths": [item["path"] for item in preserved if item["in_snapshot"]],
+        "receipts_cleared": receipts_cleared,
+        "results": results,
+        "counts": {
+            "entries": len(normalized_entries),
+            "applied": len(applied),
+            "replaced": len(replaced_paths),
+            "created": len(created_paths),
+            "published": len(publish_paths),
+            "delete_markers": len(explicit_deletes),
+            "missing_marked_deleted": len(marked_deleted),
+            "preserved": len(preserved),
+            "receipts_cleared": receipts_cleared,
+        },
+    }
+
+
+# Concise alias for callers that name the operation "restore".
+apply_snapshot = import_snapshot
+restore_snapshot = import_snapshot

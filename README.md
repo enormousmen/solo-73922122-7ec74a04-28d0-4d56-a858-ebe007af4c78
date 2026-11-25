@@ -19,6 +19,7 @@ The mirror must satisfy two properties that drive the design:
 docker compose up --build -d
 curl -s localhost:8000/status | jq .
 ./demo/demo.sh                 # out-of-order ingest, GC, resend
+./demo/snapshot_demo.sh        # log gap -> authoritative snapshot recovery
 ```
 
 Without Docker:
@@ -105,9 +106,70 @@ Receipt deletion, tombstone deletion and the watermark update are one
 transaction. On any failure the whole run rolls back: no receipt is reclaimed
 and progress does not move, so a retry starts from the same point.
 
+### `POST /snapshots` — authoritative baseline import (gap recovery)
+
+When the primary log has a sequence gap that GC cannot pass, the operator
+restores the mirror from an authoritative snapshot carrying a **baseline
+sequence number** `B`: the complete intended catalog as of `B`.
+
+Request formats (both accepted):
+
+* `multipart/form-data` with a `manifest` JSON field and one binary part per
+  publish, exactly like `/events`:
+
+  ```json
+  {"baseline_seq": 10,
+   "entries": [
+     {"path": "team/a.tgz", "operation": "publish", "file": "f0"},
+     {"path": "team/gone",  "operation": "delete"}]}
+  ```
+
+* `application/json` with inline text/base64 content:
+
+  ```json
+  {"baseline_seq": 10,
+   "entries": [
+     {"path": "team/a.tgz", "operation": "publish", "content_b64": "…"},
+     {"path": "team/gone",  "operation": "delete"}]}
+  ```
+
+Merge rules, applied in one SQLite transaction:
+
+1. If `B < gc_watermark`, the import is rejected with **`409`**
+   (`error = baseline_below_watermark`, with `baseline_seq`/`watermark`
+   fields and a human-readable `detail` string) and nothing changes.
+2. A local path whose `latest_seq > B` is **preserved untouched** — a higher
+   sequence publish or delete already received wins, even over a snapshot
+   entry for the same path (`preserved_paths` / `skipped_paths`).
+3. Every other local path (`latest_seq <= B`) named by the snapshot is
+   replaced by the snapshot state and stamped at sequence `B`.
+4. A local path with `latest_seq <= B` that is **absent from the snapshot is
+   marked deleted** at sequence `B` (`missing_paths`).
+5. Receipts `<= B` are subsumed by the authoritative snapshot (including
+   numbers that were missing from the log) and removed; the watermark
+   advances to `B`. Late events with `seq <= B` then return
+   `already_cleared`: acknowledged only, never applied, so neither the gap
+   filler nor an old resend can re-list withdrawn content.
+
+Re-importing the same baseline (`B == watermark`) is idempotent. Validation
+errors (bad paths, duplicate paths, malformed/base64/oversized content) return
+`422`/`413` before any write; a failure inside the transaction rolls the whole
+merge back, so there is never a half-applied catalog, and all committed state
+survives a restart.
+
+The rich response includes `watermark_before/after`, `applied_paths`,
+`missing_paths`, `marked_deleted`, `preserved_paths`, `skipped_paths`,
+`receipts_cleared` and a `counts` object. Compatible URL aliases
+(`/snapshot`, `/snapshots/import`, `/import-snapshot`, …; `PUT /snapshots`)
+and payload spellings (`baseline`, `paths` map, `content`/`content_b64`,
+baseline via `?baseline_seq=` or `X-Baseline-Seq`) are accepted.
+
+`demo/snapshot_demo.sh` walks through the full gap-recovery flow.
+
 ### `GET /status`, `GET /healthz`
 
-Watermark, next expected number, receipt counts and catalog counts.
+Watermark, next expected number, last imported snapshot baseline, receipt
+counts and catalog counts.
 
 ## Behaviour walkthrough
 
